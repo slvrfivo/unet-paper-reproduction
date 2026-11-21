@@ -5,12 +5,9 @@
 # ---- Cell 2 ----
 from __future__ import annotations
 
-import copy
 import json
 import math
-import os
 import random
-import sys
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,16 +18,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-try:
-    import tifffile
-    from scipy.ndimage import map_coordinates, distance_transform_edt
-    import cv2
-except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'tifffile', 'scipy', 'opencv-python-headless'])
-    import tifffile
-    from scipy.ndimage import map_coordinates, distance_transform_edt
-    import cv2
+# Dependencies are listed in requirements.txt; importing this module never installs packages.
+import cv2
+import tifffile
+from scipy.ndimage import distance_transform_edt, map_coordinates
 
 @dataclass
 class Config:
@@ -56,8 +47,6 @@ cfg = Config()
 if cfg.quick_run:
     cfg.epochs = 2
     cfg.steps_per_epoch = 6
-if not cfg.paper_channels:
-    print('주의: 현재 base_channels=32 축소 모델이며 논문 채널 수와 다릅니다.')
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -66,12 +55,9 @@ def seed_everything(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-seed_everything(cfg.seed)
+# Module-level state is side-effect free: seeding, directory creation and logging happen in main().
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 output_dir = Path(cfg.out_dir)
-output_dir.mkdir(parents=True, exist_ok=True)
-print('Device:', device, '| quick_run:', cfg.quick_run,
-      '| base_channels:', 64 if cfg.paper_channels else 32)
 
 # ---- Cell 3 ----
 DATA_MIRRORS = [
@@ -250,19 +236,27 @@ def pixel_weights(mask, class_weights, sigma, boost):
     return weights
 
 
+def frequency_class_weights(labels, indices):
+    # 두 클래스를 원본 픽셀 빈도 기반으로 균형 있게 가중. 원논문 wc와 동일 계산은 아님.
+    pixel_counts = np.bincount(labels[np.asarray(indices)].reshape(-1), minlength=2).astype(np.float64)
+    freq = pixel_counts / pixel_counts.sum()
+    weights = 1 / np.maximum(freq, 1e-5)
+    return weights / weights.mean()
+
+
 class ISBIPatchDataset(Dataset):
-    def __init__(self, images, labels, indices, training, steps_per_epoch, config):
+    def __init__(self, images, labels, indices, training, steps_per_epoch, config,
+                 class_weights=None):
         self.images = images
         self.labels = labels
         self.indices = np.asarray(indices)
         self.training = training
         self.steps = steps_per_epoch
         self.config = config
-        # 두 클래스를 원본 픽셀 빈도 기반으로 균형 있게 가중. 원논문 wc와 동일 계산은 아님.
-        pixel_counts = np.bincount(labels[self.indices].reshape(-1), minlength=2).astype(np.float64)
-        freq = pixel_counts / pixel_counts.sum()
-        self.class_weights = (1 / np.maximum(freq, 1e-5))
-        self.class_weights /= self.class_weights.mean()
+        # 검증셋에는 학습셋 가중치를 넘겨 train/val loss가 같은 기준으로 계산되게 한다.
+        if class_weights is None:
+            class_weights = frequency_class_weights(labels, self.indices)
+        self.class_weights = np.asarray(class_weights, dtype=np.float64)
 
     def __len__(self):
         return self.steps if self.training else len(self.indices)
@@ -346,7 +340,8 @@ def run_training(cfg: Config, images, labels, device):
     val_idx = np.arange(24, 30)
     train_dataset = ISBIPatchDataset(images, labels, train_idx, True,
                                     cfg.steps_per_epoch, cfg)
-    val_dataset = ISBIPatchDataset(images, labels, val_idx, False, 0, cfg)
+    val_dataset = ISBIPatchDataset(images, labels, val_idx, False, 0, cfg,
+                                  class_weights=train_dataset.class_weights)
     train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=False,
                               num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'))
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
@@ -446,6 +441,12 @@ def plot_history(history, destination):
 
 # ---- Cell 8 ----
 def main():
+    seed_everything(cfg.seed)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print('Device:', device, '| quick_run:', cfg.quick_run,
+          '| base_channels:', 64 if cfg.paper_channels else 32)
+    if not cfg.paper_channels:
+        print('주의: 현재 base_channels=32 축소 모델이며 논문 채널 수와 다릅니다.')
     check_paper_geometry()
     images, labels = download_isbi(cfg.data_dir)
     print('Images:', images.shape, 'Labels:', labels.shape, 'Classes:', np.unique(labels))
@@ -612,11 +613,17 @@ def run_threshold_sweep():
     plt.show()
     plt.close(fig)
 
-    # This threshold is tuned on validation slices only, so do not call it a test score.
-    best_row = max(rows, key=lambda r: r['membrane_iou'])
-    print(f"\nBest validation Membrane IoU: threshold={best_row['threshold']:.2f}, "
-          f"Membrane IoU={best_row['membrane_iou']:.4f}, mIoU={best_row['mIoU']:.4f}")
+    # Selection criterion: overall mIoU (the README headline). This threshold is tuned on the
+    # same validation slices, so do not call it a test score. Membrane IoU/recall can drop
+    # while false positives fall, so the trade-off is printed alongside.
+    baseline = next(r for r in rows if r['threshold'] == 0.5)
+    best_row = max(rows, key=lambda r: r['mIoU'])
+    fp_change = (best_row['membrane_fp_pixels'] / max(baseline['membrane_fp_pixels'], 1) - 1) * 100
+    print(f"\nSelected threshold (max validation mIoU): {best_row['threshold']:.2f} | "
+          f"mIoU={best_row['mIoU']:.4f}, Membrane IoU={best_row['membrane_iou']:.4f}, "
+          f"recall={best_row['membrane_recall']:.4f}, FP pixels vs 0.5: {fp_change:+.1f}%")
     print('Saved:', SWEEP_DIR.resolve())
+    return rows, best_row
 
 
 if __name__ == '__main__':

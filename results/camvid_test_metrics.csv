@@ -1,0 +1,7 @@
+dataset,learning_rate,batch_size,epochs,model,test_mIoU,test_mean_dice,test_pixel_accuracy
+CamVid,0.001,8,20,U-Net,0.3297,0.4031,0.7733
+CamVid,0.001,8,20,No-Skip,0.2728,0.3350,0.7349
+CamVid,0.0003,8,20,U-Net,0.2849,0.3550,0.7337
+CamVid,0.0003,8,20,No-Skip,0.2470,,
+CamVid,0.001,4,20,U-Net,0.3464,0.4163,0.7939
+CamVid,0.001,4,20,No-Skip,0.3460,0.4183,

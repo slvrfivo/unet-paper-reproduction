@@ -1,0 +1,9 @@
+experiment,learning_rate,epochs,boundary_boost,membrane_threshold,validation_full_image_mIoU,membrane_IoU
+initial,0.01,12,2.0,0.5,0.5813,0.4260
+lr_0.001_epoch20,0.001,20,2.0,0.5,0.6842,0.5343
+boundary_boost0_epoch20,0.001,20,0.0,0.5,0.6577,0.4923
+epoch20_threshold_sweep_0.5,0.001,20,2.0,0.5,0.6859,0.5350
+epoch20_threshold_sweep_0.6,0.001,20,2.0,0.6,0.7028,0.5446
+epoch40_threshold_sweep_0.5,0.001,40,2.0,0.5,0.7352,0.5976
+epoch40_threshold_sweep_0.6,0.001,40,2.0,0.6,0.7388,0.5938
+epoch40_threshold_sweep_0.7,0.001,40,2.0,0.7,0.7254,0.5637

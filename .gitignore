@@ -1,0 +1,12 @@
+# Data, trained weights, and notebook/runtime outputs
+/data/
+/isbi2012_data/
+/camvid_unet_results/
+/isbi2012_unet_paper_results/
+*.pt
+*.pth
+*.ckpt
+*.zip
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store

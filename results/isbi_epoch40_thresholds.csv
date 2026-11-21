@@ -1,0 +1,4 @@
+membrane_threshold,mIoU,membrane_IoU,membrane_precision,membrane_recall,membrane_false_positive_pixels
+0.5,0.7352,0.5976,0.6960,0.8088,109150
+0.6,0.7388,0.5938,0.7509,0.7395,75820
+0.7,0.7254,0.5637,0.8124,0.6480,46249

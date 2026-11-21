@@ -478,145 +478,147 @@ def main():
     print('Saved outputs:', output_dir.resolve())
     return result
 
+# Threshold analysis is a separate callable step; importing the module does not run training or inference.
+def run_threshold_sweep():
+    """Evaluate saved checkpoint thresholds on the held-out validation slices."""
+    import csv
+
+    MEMBRANE_CLASS = 0        # ISBI masks: 0=membrane (black), 1=cell interior (white)
+    THRESHOLDS = (0.5, 0.6, 0.7)
+    CKPT_PATH = Path(cfg.out_dir) / 'best_paper_unet.pt'
+    SWEEP_DIR = Path(cfg.out_dir) / 'threshold_sweep'
+    SWEEP_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not CKPT_PATH.is_file():
+        raise FileNotFoundError(
+            f'최고 성능 체크포인트를 찾지 못했습니다: {CKPT_PATH}\n'
+            '기존 학습 런타임에서 실행하거나, best_paper_unet.pt를 해당 경로에 넣어주세요.\n'
+            'Colab 런타임이 초기화된 경우 체크포인트가 삭제됐을 수 있습니다.'
+        )
+
+    # 이전 학습에서 저장된 모델의 설정을 읽어 정확한 채널 수로 복구한다.
+    try:
+        checkpoint = torch.load(CKPT_PATH, map_location='cpu', weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(CKPT_PATH, map_location='cpu')
+    train_cfg = checkpoint.get('config', {})
+    base_channels = 64 if train_cfg.get('paper_channels', cfg.paper_channels) else 32
+    model_sweep = UNet2015(
+        base_channels=base_channels,
+        num_classes=2,
+        dropout_p=train_cfg.get('dropout_p', cfg.dropout_p)
+    ).to(device)
+    model_sweep.load_state_dict(checkpoint['model'], strict=True)
+    model_sweep.eval()
+    print('Loaded checkpoint:', CKPT_PATH)
+    print('Best training-time center validation mIoU:', checkpoint.get('best_center_val_mIoU', '(unavailable)'))
+
+    images_sweep, labels_sweep = download_isbi(cfg.data_dir)
+    validation_indices = np.arange(24, 30)  # original train 0..23, val 24..29
+
+    @torch.no_grad()
+    def predict_membrane_probability_full(model, gray, device):
+        # Returns class-0 (membrane) probability for the entire image via overlap-tile.
+        model.eval()
+        h, w = gray.shape
+        rows, cols = math.ceil(h / OUTPUT_TILE), math.ceil(w / OUTPUT_TILE)
+        extra_y = rows * OUTPUT_TILE - h
+        extra_x = cols * OUTPUT_TILE - w
+        padded = np.pad(
+            gray, ((BORDER, BORDER + extra_y), (BORDER, BORDER + extra_x)),
+            mode='reflect'
+        )
+        probs = np.zeros((rows * OUTPUT_TILE, cols * OUTPUT_TILE), dtype=np.float32)
+        for i in range(rows):
+            for j in range(cols):
+                y, x = i * OUTPUT_TILE, j * OUTPUT_TILE
+                tile = padded[y:y + INPUT_TILE, x:x + INPUT_TILE]
+                assert tile.shape == (INPUT_TILE, INPUT_TILE), tile.shape
+                inp = torch.from_numpy(tile[None, None].copy()).float().to(device)
+                logits = model(inp)
+                p_membrane = torch.softmax(logits, dim=1)[0, MEMBRANE_CLASS]
+                probs[y:y+OUTPUT_TILE, x:x+OUTPUT_TILE] = p_membrane.cpu().numpy()
+        return probs[:h, :w]
+
+
+    def predict_mask_at_threshold(prob_membrane, threshold):
+        # 0 (black) = membrane. Higher threshold => fewer pixels predicted membrane.
+        return np.where(prob_membrane >= threshold, 0, 1).astype(np.uint8)
+
+    # Run network inference ONCE per image. Sweep thresholds on cached probabilities.
+    probability_maps = []
+    for index in validation_indices:
+        probability_maps.append(
+            predict_membrane_probability_full(model_sweep, images_sweep[int(index)], device)
+        )
+
+    rows = []
+    predictions_by_threshold = {}
+    for t in THRESHOLDS:
+        cm = np.zeros((2, 2), dtype=np.int64)
+        masks = []
+        for idx, prob in zip(validation_indices, probability_maps):
+            prediction = predict_mask_at_threshold(prob, t)
+            masks.append(prediction)
+            ground_truth = labels_sweep[int(idx)]
+            confusion_update(cm, torch.from_numpy(prediction), torch.from_numpy(ground_truth))
+        metrics = compute_metrics(cm)
+        tp = int(cm[MEMBRANE_CLASS, MEMBRANE_CLASS])
+        fp = int(cm[1, MEMBRANE_CLASS])  # GT=interior, prediction=membrane => black false positives
+        fn = int(cm[MEMBRANE_CLASS, 1])  # GT=membrane, prediction=interior
+        metrics.update({
+            'threshold': float(t),
+            'membrane_precision': tp / max(tp + fp, 1),
+            'membrane_recall': tp / max(tp + fn, 1),
+            'membrane_fp_pixels': fp,
+            'membrane_fn_pixels': fn,
+        })
+        rows.append(metrics)
+        predictions_by_threshold[t] = masks
+
+    print('\nWhole-image validation results (6 images, NOT official test):')
+    print('Threshold | mIoU   | Membrane IoU | Membrane Precision | Membrane Recall | Black FP pixels')
+    for r in rows:
+        print(f"{r['threshold']:>9.2f} | {r['mIoU']:.4f} | {r['membrane_iou']:.4f}      | "
+              f"{r['membrane_precision']:.4f}             | {r['membrane_recall']:.4f}          | "
+              f"{r['membrane_fp_pixels']:,}")
+
+    with (SWEEP_DIR / 'threshold_metrics.csv').open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    (SWEEP_DIR / 'threshold_metrics.json').write_text(
+        json.dumps(rows, indent=2, ensure_ascii=False), encoding='utf-8'
+    )
+
+    # Visual comparison on identical validation slices; black = membrane.
+    import matplotlib.pyplot as plt
+    n_show = min(3, len(validation_indices))
+    fig, axes = plt.subplots(n_show, 2 + len(THRESHOLDS), figsize=(17, 3.5 * n_show), squeeze=False)
+    for k in range(n_show):
+        idx = int(validation_indices[k])
+        mats = [images_sweep[idx], labels_sweep[idx]] + [
+            predictions_by_threshold[t][k] for t in THRESHOLDS
+        ]
+        titles = ['EM input', 'Ground truth', *[f'Pred threshold={t:.1f}' for t in THRESHOLDS]]
+        for j, (mat, title) in enumerate(zip(mats, titles)):
+            axes[k, j].imshow(mat, cmap='gray', vmin=0, vmax=1)
+            axes[k, j].set_title(title)
+            axes[k, j].axis('off')
+        axes[k, 0].set_ylabel(f'Validation slice {idx}', fontsize=11)
+    fig.suptitle('ISBI 2012: membrane=black (class 0); higher threshold is more conservative', y=1.01)
+    fig.tight_layout()
+    fig.savefig(SWEEP_DIR / 'threshold_comparison.png', dpi=160, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+
+    # This threshold is tuned on validation slices only, so do not call it a test score.
+    best_row = max(rows, key=lambda r: r['membrane_iou'])
+    print(f"\nBest validation Membrane IoU: threshold={best_row['threshold']:.2f}, "
+          f"Membrane IoU={best_row['membrane_iou']:.4f}, mIoU={best_row['mIoU']:.4f}")
+    print('Saved:', SWEEP_DIR.resolve())
+
+
 if __name__ == '__main__':
     main()
-
-# ---- Cell 9 ----
-# ===== Threshold sweep: saved checkpoint only (NO retraining) =====
-import csv
-
-MEMBRANE_CLASS = 0        # ISBI masks: 0=membrane (black), 1=cell interior (white)
-THRESHOLDS = (0.5, 0.6, 0.7)
-CKPT_PATH = Path(cfg.out_dir) / 'best_paper_unet.pt'
-SWEEP_DIR = Path(cfg.out_dir) / 'threshold_sweep'
-SWEEP_DIR.mkdir(parents=True, exist_ok=True)
-
-if not CKPT_PATH.is_file():
-    raise FileNotFoundError(
-        f'최고 성능 체크포인트를 찾지 못했습니다: {CKPT_PATH}\n'
-        '기존 학습 런타임에서 실행하거나, best_paper_unet.pt를 해당 경로에 넣어주세요.\n'
-        'Colab 런타임이 초기화된 경우 체크포인트가 삭제됐을 수 있습니다.'
-    )
-
-# 이전 학습에서 저장된 모델의 설정을 읽어 정확한 채널 수로 복구한다.
-try:
-    checkpoint = torch.load(CKPT_PATH, map_location='cpu', weights_only=False)
-except TypeError:
-    checkpoint = torch.load(CKPT_PATH, map_location='cpu')
-train_cfg = checkpoint.get('config', {})
-base_channels = 64 if train_cfg.get('paper_channels', cfg.paper_channels) else 32
-model_sweep = UNet2015(
-    base_channels=base_channels,
-    num_classes=2,
-    dropout_p=train_cfg.get('dropout_p', cfg.dropout_p)
-).to(device)
-model_sweep.load_state_dict(checkpoint['model'], strict=True)
-model_sweep.eval()
-print('Loaded checkpoint:', CKPT_PATH)
-print('Best training-time center validation mIoU:', checkpoint.get('best_center_val_mIoU', '(unavailable)'))
-
-images_sweep, labels_sweep = download_isbi(cfg.data_dir)
-validation_indices = np.arange(24, 30)  # original train 0..23, val 24..29
-
-@torch.no_grad()
-def predict_membrane_probability_full(model, gray, device):
-    # Returns class-0 (membrane) probability for the entire image via overlap-tile.
-    model.eval()
-    h, w = gray.shape
-    rows, cols = math.ceil(h / OUTPUT_TILE), math.ceil(w / OUTPUT_TILE)
-    extra_y = rows * OUTPUT_TILE - h
-    extra_x = cols * OUTPUT_TILE - w
-    padded = np.pad(
-        gray, ((BORDER, BORDER + extra_y), (BORDER, BORDER + extra_x)),
-        mode='reflect'
-    )
-    probs = np.zeros((rows * OUTPUT_TILE, cols * OUTPUT_TILE), dtype=np.float32)
-    for i in range(rows):
-        for j in range(cols):
-            y, x = i * OUTPUT_TILE, j * OUTPUT_TILE
-            tile = padded[y:y + INPUT_TILE, x:x + INPUT_TILE]
-            assert tile.shape == (INPUT_TILE, INPUT_TILE), tile.shape
-            inp = torch.from_numpy(tile[None, None].copy()).float().to(device)
-            logits = model(inp)
-            p_membrane = torch.softmax(logits, dim=1)[0, MEMBRANE_CLASS]
-            probs[y:y+OUTPUT_TILE, x:x+OUTPUT_TILE] = p_membrane.cpu().numpy()
-    return probs[:h, :w]
-
-
-def predict_mask_at_threshold(prob_membrane, threshold):
-    # 0 (black) = membrane. Higher threshold => fewer pixels predicted membrane.
-    return np.where(prob_membrane >= threshold, 0, 1).astype(np.uint8)
-
-# Run network inference ONCE per image. Sweep thresholds on cached probabilities.
-probability_maps = []
-for index in validation_indices:
-    probability_maps.append(
-        predict_membrane_probability_full(model_sweep, images_sweep[int(index)], device)
-    )
-
-rows = []
-predictions_by_threshold = {}
-for t in THRESHOLDS:
-    cm = np.zeros((2, 2), dtype=np.int64)
-    masks = []
-    for idx, prob in zip(validation_indices, probability_maps):
-        prediction = predict_mask_at_threshold(prob, t)
-        masks.append(prediction)
-        ground_truth = labels_sweep[int(idx)]
-        confusion_update(cm, torch.from_numpy(prediction), torch.from_numpy(ground_truth))
-    metrics = compute_metrics(cm)
-    tp = int(cm[MEMBRANE_CLASS, MEMBRANE_CLASS])
-    fp = int(cm[1, MEMBRANE_CLASS])  # GT=interior, prediction=membrane => black false positives
-    fn = int(cm[MEMBRANE_CLASS, 1])  # GT=membrane, prediction=interior
-    metrics.update({
-        'threshold': float(t),
-        'membrane_precision': tp / max(tp + fp, 1),
-        'membrane_recall': tp / max(tp + fn, 1),
-        'membrane_fp_pixels': fp,
-        'membrane_fn_pixels': fn,
-    })
-    rows.append(metrics)
-    predictions_by_threshold[t] = masks
-
-print('\nWhole-image validation results (6 images, NOT official test):')
-print('Threshold | mIoU   | Membrane IoU | Membrane Precision | Membrane Recall | Black FP pixels')
-for r in rows:
-    print(f"{r['threshold']:>9.2f} | {r['mIoU']:.4f} | {r['membrane_iou']:.4f}      | "
-          f"{r['membrane_precision']:.4f}             | {r['membrane_recall']:.4f}          | "
-          f"{r['membrane_fp_pixels']:,}")
-
-with (SWEEP_DIR / 'threshold_metrics.csv').open('w', newline='', encoding='utf-8') as f:
-    writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-    writer.writeheader()
-    writer.writerows(rows)
-(SWEEP_DIR / 'threshold_metrics.json').write_text(
-    json.dumps(rows, indent=2, ensure_ascii=False), encoding='utf-8'
-)
-
-# Visual comparison on identical validation slices; black = membrane.
-import matplotlib.pyplot as plt
-n_show = min(3, len(validation_indices))
-fig, axes = plt.subplots(n_show, 2 + len(THRESHOLDS), figsize=(17, 3.5 * n_show), squeeze=False)
-for k in range(n_show):
-    idx = int(validation_indices[k])
-    mats = [images_sweep[idx], labels_sweep[idx]] + [
-        predictions_by_threshold[t][k] for t in THRESHOLDS
-    ]
-    titles = ['EM input', 'Ground truth', *[f'Pred threshold={t:.1f}' for t in THRESHOLDS]]
-    for j, (mat, title) in enumerate(zip(mats, titles)):
-        axes[k, j].imshow(mat, cmap='gray', vmin=0, vmax=1)
-        axes[k, j].set_title(title)
-        axes[k, j].axis('off')
-    axes[k, 0].set_ylabel(f'Validation slice {idx}', fontsize=11)
-fig.suptitle('ISBI 2012: membrane=black (class 0); higher threshold is more conservative', y=1.01)
-fig.tight_layout()
-fig.savefig(SWEEP_DIR / 'threshold_comparison.png', dpi=160, bbox_inches='tight')
-plt.show()
-plt.close(fig)
-
-# This threshold is tuned on validation slices only, so do not call it a test score.
-best_row = max(rows, key=lambda r: r['membrane_iou'])
-print(f"\nBest validation Membrane IoU: threshold={best_row['threshold']:.2f}, "
-      f"Membrane IoU={best_row['membrane_iou']:.4f}, mIoU={best_row['mIoU']:.4f}")
-print('Saved:', SWEEP_DIR.resolve())
-
+    run_threshold_sweep()

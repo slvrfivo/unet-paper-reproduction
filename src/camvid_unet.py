@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import csv
 import random
-import shutil
 import urllib.request
 import zipfile
 from dataclasses import dataclass

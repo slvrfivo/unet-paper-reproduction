@@ -41,6 +41,8 @@ From a paper-reading study: I first tested a lightweight U-Net on road-scene seg
 
 [Batch-8 notebook](notebooks/camvid_unet_baseline_bs8.ipynb) · [Batch-4 notebook](notebooks/camvid_unet_batch4.ipynb) · [Additional lower-LR Colab run](https://colab.research.google.com/drive/1EOwPPR6L0HSJRXNVQhSDa4Fe25RRh0I6) · [CamVid curves](figures/camvid_learning_curves.png)
 
+The no-skip run at LR 0.0003 recorded only mIoU; its Dice and pixel accuracy are left blank in [`results/camvid_test_metrics.csv`](results/camvid_test_metrics.csv) rather than estimated.
+
 **Interpretation:** Skip connections helped at batch size 8 but not clearly at batch size 4. A smaller batch size also increases optimizer updates per epoch. These experiments use single runs, so they do not prove that any one change consistently helps.
 
 ## 2. ISBI 2012 — closer to the original architecture
@@ -61,6 +63,8 @@ The paper used biomedical imagery including the [ISBI 2012 EM segmentation task]
 
 ![ISBI training curves](figures/isbi_training_curves.png)
 
+*In the recorded curves, validation loss used class weights computed from the validation slices. The current code reuses the training-set weights so train and validation loss share one scale. Checkpoint selection and all reported IoU/Dice values are unaffected, because they do not use the loss.*
+
 ### Training and hyperparameter experiments
 
 Early training sometimes collapsed toward a single-class prediction. I investigated lower learning rates, longer training, and a reduced boundary-loss weight. Training longer improved validation overlap; removing the approximate boundary weight degraded it.
@@ -71,10 +75,11 @@ Early training sometimes collapsed toward a single-class prediction. I investiga
 | Lower LR and longer training | 0.001 | 20 | 2.0 | 0.5 | 0.6842 | 0.5343 |
 | Remove boundary boost | 0.001 | 20 | 0.0 | 0.5 | 0.6577 | 0.4923 |
 | Threshold-sweep 20-epoch run | 0.001 | 20 | 2.0 | 0.5 | 0.6859 | 0.5350 |
+| 20 epochs + threshold 0.6 | 0.001 | 20 | 2.0 | 0.6 | 0.7028 | 0.5446 |
 | Threshold-sweep 40-epoch run | 0.001 | 40 | 2.0 | 0.5 | 0.7352 | **0.5976** |
 | **40 epochs + threshold 0.6** | **0.001** | **40** | **2.0** | **0.6** | **0.7388** | 0.5938 |
 
-The two 20-epoch runs were separate training runs and need not have identical scores. Because both LR and epochs changed between the first two rows, improvements cannot be attributed to LR alone.
+The two 20-epoch runs were separate training runs and need not have identical scores. Because both LR and epochs changed between the first two rows, improvements cannot be attributed to LR alone. Raising the threshold to 0.6 increased mIoU at both 20 and 40 epochs.
 
 ### Error analysis — isolated black spots in cell interiors
 
@@ -87,6 +92,8 @@ To suppress false-positive membrane predictions, I swept the **probability thres
 | 0.7 | 0.7254 | 0.5637 | **0.8124** | 0.6480 | **46,249** |
 
 At threshold 0.6, false-positive membrane pixels decreased **30.5%** relative to threshold 0.5, while overall mIoU increased slightly. **Membrane IoU and recall decreased**, however: this threshold is a trade-off, not an improvement in every metric.
+
+**Selection criterion:** 0.6 is chosen because it gives the highest overall validation mIoU; `run_threshold_sweep()` applies the same rule and prints the membrane IoU, recall and false-positive change next to it. Selecting by membrane IoU alone would keep 0.5.
 
 [Open the full-size threshold comparison](figures/isbi_threshold_comparison.png)
 

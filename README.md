@@ -14,6 +14,12 @@ From a paper-reading study: I first tested a lightweight U-Net on road-scene seg
 
 > **Scope:** This is an *architecture-focused reproduction*. CamVid numbers are evaluated on its test split; ISBI numbers use six held-out slices from the *public training data*, not the hidden ISBI test set. Scores across the two datasets should not be compared directly.
 
+### ISBI 2012 — qualitative results
+
+![ISBI 2012 EM: input, ground truth, and membrane-threshold predictions](figures/isbi_threshold_comparison.png)
+
+*Predictions on held-out public training slices. Black pixels denote cell membranes; raising the membrane threshold reduces false positives but can also miss true membrane pixels.*
+
 ## 1. CamVid — applying U-Net outside biomedical imaging
 
 [CamVid](http://mi.eng.cam.ac.uk/research/projects/VideoRec/CamVid/) consists of road-driving images with pixel-level semantic labels (road, buildings, sky, vehicles, pedestrians, and others). I selected it to see whether the U-Net encoder-decoder works on a different domain and to test the contribution of skip connections.
@@ -82,7 +88,7 @@ To suppress false-positive membrane predictions, I swept the **probability thres
 
 At threshold 0.6, false-positive membrane pixels decreased **30.5%** relative to threshold 0.5, while overall mIoU increased slightly. **Membrane IoU and recall decreased**, however: this threshold is a trade-off, not an improvement in every metric.
 
-![ISBI input, ground truth and threshold comparison](figures/isbi_threshold_comparison.png)
+[Open the full-size threshold comparison](figures/isbi_threshold_comparison.png)
 
 [ISBI trained predictions](figures/isbi_predictions.png) · [Final code-only notebook](notebooks/isbi2012_paper_style_epoch40.ipynb) · [Original executed Colab with outputs](https://colab.research.google.com/drive/1VZBbi64BACQJgoDD09YBTczfm3vETUEj)
 
@@ -96,7 +102,15 @@ At threshold 0.6, false-positive membrane pixels decreased **30.5%** relative to
 | `results/` | CSV summaries of reported metrics |
 | `requirements.txt` | Main Python dependencies |
 
-Open a notebook in Google Colab and select a **GPU runtime**. Notebook cells download the public dataset mirrors; training ISBI at full width is computationally demanding. The ISBI threshold-sweep section loads `isbi2012_unet_paper_results/best_paper_unet.pt`, so run training first or provide the corresponding checkpoint. **No dataset TIFF files or pretrained checkpoints are redistributed here.**
+For a local run from the repository root (a **GPU is strongly recommended**, especially for the full-width ISBI model):
+
+```bash
+python -m pip install -r requirements.txt
+python src/camvid_unet.py
+python src/isbi2012_unet.py
+```
+
+Run either script independently: each downloads its dataset from a public mirror and saves generated results in its corresponding output directory. The ISBI script trains the model first, then evaluates thresholds on its saved best checkpoint; the threshold step is also available as `run_threshold_sweep()` when imported. You can alternatively open the notebooks in **Google Colab with a GPU runtime**. The ISBI notebook's threshold section requires `isbi2012_unet_paper_results/best_paper_unet.pt` from the preceding training step (or an existing matching checkpoint). **No dataset TIFF files or pretrained checkpoints are redistributed here.**
 
 ## Limitations
 

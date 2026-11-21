@@ -1,5 +1,7 @@
 # U-Net Paper Reproduction & Segmentation Experiments
 
+**English** | [한국어](README.ko.md)
+
 **PyTorch · U-Net (MICCAI 2015) · CamVid · ISBI 2012**
 
 From a paper-reading study: I first tested a lightweight U-Net on road-scene segmentation, then implemented a version closer to the original U-Net for biomedical electron microscopy. The project focuses on architecture, ablation, training stability, and segmentation errors—not on reproducing the original paper's official benchmark.
